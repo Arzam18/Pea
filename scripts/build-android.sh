@@ -56,16 +56,30 @@ export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 export CARGO_PROFILE_RELEASE_LTO=fat
 
 PAGE_FLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+COMMON_RUSTFLAGS="-C opt-level=3 -C target-cpu=generic $PAGE_FLAGS"
 
-# Generic ARMv8-A with mandatory AArch64 NEON; Dotprod is deliberately disabled.
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C opt-level=3 -C target-cpu=generic -C target-feature=+neon $PAGE_FLAGS"
-cargo build --locked --release --bin Pea --target "$TARGET"
-cp "target/$TARGET/release/Pea" "Pea-Android-ARM64-NEON"
+# Build each variant in a separate Cargo target directory. This prevents any
+# cached objects from the baseline build being reused for the Dotprod build.
+# Use RUSTFLAGS explicitly so the feature setting is applied to every rustc
+# invocation for the target, including the final Pea binary.
+export RUSTFLAGS="$COMMON_RUSTFLAGS -C target-feature=+neon"
+echo "Building baseline ARM64 NEON; rustc flags: $RUSTFLAGS"
+cargo build --locked --release --bin Pea --target "$TARGET" --target-dir "$ROOT/target/android-neon"
+cp "$ROOT/target/android-neon/$TARGET/release/Pea" "Pea-Android-ARM64-NEON"
 
-# Add the explicit SDOT kernel for CPUs with ARMv8.2-A Dotprod (e.g. the user's A16).
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C opt-level=3 -C target-cpu=generic -C target-feature=+neon,+dotprod $PAGE_FLAGS"
-cargo build --locked --release --bin Pea --target "$TARGET"
-cp "target/$TARGET/release/Pea" "Pea-Android-ARM64-DOTPROD"
+# Confirm this Rust toolchain recognizes the Dotprod cfg before compiling.
+DOTPROD_CFG="$(rustc --print cfg --target "$TARGET" $COMMON_RUSTFLAGS -C target-feature=+neon,+dotprod)"
+printf '%s\n' "$DOTPROD_CFG" | grep -Fxq 'target_feature="dotprod"' || {
+    echo "ERROR: rustc did not enable target_feature=dotprod for $TARGET." >&2
+    printf '%s\n' "$DOTPROD_CFG" >&2
+    exit 1
+}
+
+# Compile the exact SDOT path in src/nnue/network.rs for ARMv8.2-A Dotprod.
+export RUSTFLAGS="$COMMON_RUSTFLAGS -C target-feature=+neon,+dotprod"
+echo "Building ARM64 Dotprod; rustc flags: $RUSTFLAGS"
+cargo build --locked --release --bin Pea --target "$TARGET" --target-dir "$ROOT/target/android-dotprod"
+cp "$ROOT/target/android-dotprod/$TARGET/release/Pea" "Pea-Android-ARM64-DOTPROD"
 
 for BIN in Pea-Android-ARM64-NEON Pea-Android-ARM64-DOTPROD; do
     echo "===== $BIN ====="
@@ -81,8 +95,14 @@ if [[ ! -x "$OBJDUMP" ]]; then
     echo "ERROR: NDK llvm-objdump missing." >&2
     exit 1
 fi
-if ! "$OBJDUMP" -d Pea-Android-ARM64-DOTPROD | grep -Eq '\bsdot\b'; then
-    echo "ERROR: Dotprod binary contains no SDOT instruction." >&2
+# Tell LLVM's disassembler that this binary is allowed to use Dotprod.
+# Without --mattr, some llvm-objdump builds decode SDOT as an unknown word.
+DOTPROD_DISASSEMBLY="$(mktemp)"
+trap 'rm -f "$DOTPROD_DISASSEMBLY"' EXIT
+"$OBJDUMP" --mattr=+dotprod -d Pea-Android-ARM64-DOTPROD > "$DOTPROD_DISASSEMBLY"
+if ! grep -Eiq '[[:space:]]sdot[[:space:]]' "$DOTPROD_DISASSEMBLY"; then
+    echo "ERROR: Dotprod binary contains no decoded SDOT instruction (disassembly used --mattr=+dotprod)." >&2
+    grep -Ei 'unknown|\.word|dotprod' "$DOTPROD_DISASSEMBLY" | head -20 >&2 || true
     exit 1
 fi
 if ! "$OBJDUMP" -d Pea-Android-ARM64-NEON | grep -Eq '\b(add|smax|smin|smull|sqxtn|sqxtun)\s+v[0-9]+'; then
