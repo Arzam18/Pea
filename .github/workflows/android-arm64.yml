@@ -1,0 +1,110 @@
+name: Build Pea for Android ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Optional repository variable PEA_NETWORK_URL can point to the matching
+  # quantised.bin in a fork. The upstream archive is used by default.
+  PEA_NETWORK_URL: ${{ vars.PEA_NETWORK_URL }}
+
+jobs:
+  build:
+    name: Build NEON and Dotprod binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java for Android SDK tools
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Rust 1.93.1 and Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK r27c without legacy SDK tools
+        shell: bash
+        run: |
+          set -eu
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "Android SDK root not found: $SDK_ROOT" >&2
+            exit 1
+          fi
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [[ ! -x "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort | tail -n 1 || true)"
+          fi
+          if [[ -z "$SDKMANAGER" || ! -x "$SDKMANAGER" ]]; then
+            echo "sdkmanager not found under $SDK_ROOT/cmdline-tools" >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "ndk;27.2.12479018"
+          NDK_HOME="$SDK_ROOT/ndk/27.2.12479018"
+          test -x "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          {
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
+            echo "ANDROID_NDK_HOME=$NDK_HOME"
+            echo "ANDROID_NDK_ROOT=$NDK_HOME"
+            echo "ANDROID_NDK_VERSION=27.2.12479018"
+            echo "ANDROID_API=24"
+          } >> "$GITHUB_ENV"
+
+      - name: Download and validate embedded Net 0 network
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p nnue/files
+          NETWORK_URL="${PEA_NETWORK_URL:-https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/nnue/files/quantised.bin}"
+          echo "Trying the network from this fork/branch: $NETWORK_URL"
+          if ! curl --fail --location --retry 2 --retry-delay 2 "$NETWORK_URL" \
+            --output nnue/files/quantised.bin; then
+            if [[ -n "${PEA_NETWORK_URL:-}" ]]; then
+              echo "The configured PEA_NETWORK_URL could not be downloaded." >&2
+              exit 1
+            fi
+            echo "No fork network found; trying the upstream Pea network."
+            curl --fail --location --retry 4 --retry-delay 2 \
+              "https://raw.githubusercontent.com/WGCodings/Pea/master/nnue/files/quantised.bin" \
+              --output nnue/files/quantised.bin
+          fi
+          BYTES="$(stat -c '%s' nnue/files/quantised.bin)"
+          test "$BYTES" = "9655872" || {
+            echo "Unexpected NNUE size: $BYTES bytes (expected 9655872 for this source's 1536-hidden network)." >&2
+            exit 1
+          }
+          sha256sum nnue/files/quantised.bin | tee pea-network.sha256
+
+      - name: Build ARM64 NEON and Dotprod variants
+        shell: bash
+        run: ./scripts/build-android.sh
+
+      - name: Build and run host UCI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --bin Pea
+          python3 scripts/uci-smoke-test.py target/release/Pea
+
+      - name: Upload Android binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pea-Android-ARM64-NEON-DOTPROD
+          path: |
+            dist/Pea-Android-ARM64-NEON
+            dist/Pea-Android-ARM64-DOTPROD
+            dist/pea-network.sha256
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
