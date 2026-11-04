@@ -58,16 +58,24 @@ export CARGO_PROFILE_RELEASE_LTO=fat
 PAGE_FLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
 COMMON_RUSTFLAGS="-C opt-level=3 -C target-cpu=generic $PAGE_FLAGS"
 
-# Build each variant in a separate Cargo target directory. This prevents any
-# cached objects from the baseline build being reused for the Dotprod build.
-# Use RUSTFLAGS explicitly so the feature setting is applied to every rustc
-# invocation for the target, including the final Pea binary.
+# Verify that this Rust toolchain recognizes the AArch64 NEON target feature.
+# AArch64 devices have Advanced SIMD, and this check ensures the cfg-selected
+# NEON implementations in src/nnue/network.rs are compiled for this target.
+NEON_CFG="$(rustc --print cfg --target "$TARGET" $COMMON_RUSTFLAGS -C target-feature=+neon)"
+printf '%s\n' "$NEON_CFG" | grep -Fxq 'target_feature="neon"' || {
+    echo "ERROR: rustc did not enable target_feature=neon for $TARGET." >&2
+    printf '%s\n' "$NEON_CFG" >&2
+    exit 1
+}
+
+# Separate target directories prevent NEON and Dotprod objects being reused
+# across builds. Explicit RUSTFLAGS apply the intended feature to all crates.
 export RUSTFLAGS="$COMMON_RUSTFLAGS -C target-feature=+neon"
 echo "Building baseline ARM64 NEON; rustc flags: $RUSTFLAGS"
 cargo build --locked --release --bin Pea --target "$TARGET" --target-dir "$ROOT/target/android-neon"
 cp "$ROOT/target/android-neon/$TARGET/release/Pea" "Pea-Android-ARM64-NEON"
 
-# Confirm this Rust toolchain recognizes the Dotprod cfg before compiling.
+# Confirm rustc activates the Dotprod cfg before compiling the inline SDOT path.
 DOTPROD_CFG="$(rustc --print cfg --target "$TARGET" $COMMON_RUSTFLAGS -C target-feature=+neon,+dotprod)"
 printf '%s\n' "$DOTPROD_CFG" | grep -Fxq 'target_feature="dotprod"' || {
     echo "ERROR: rustc did not enable target_feature=dotprod for $TARGET." >&2
@@ -75,7 +83,6 @@ printf '%s\n' "$DOTPROD_CFG" | grep -Fxq 'target_feature="dotprod"' || {
     exit 1
 }
 
-# Compile the exact SDOT path in src/nnue/network.rs for ARMv8.2-A Dotprod.
 export RUSTFLAGS="$COMMON_RUSTFLAGS -C target-feature=+neon,+dotprod"
 echo "Building ARM64 Dotprod; rustc flags: $RUSTFLAGS"
 cargo build --locked --release --bin Pea --target "$TARGET" --target-dir "$ROOT/target/android-dotprod"
@@ -95,20 +102,34 @@ if [[ ! -x "$OBJDUMP" ]]; then
     echo "ERROR: NDK llvm-objdump missing." >&2
     exit 1
 fi
-# Tell LLVM's disassembler that this binary is allowed to use Dotprod.
-# Without --mattr, some llvm-objdump builds decode SDOT as an unknown word.
+NEON_DISASSEMBLY="$(mktemp)"
 DOTPROD_DISASSEMBLY="$(mktemp)"
-trap 'rm -f "$DOTPROD_DISASSEMBLY"' EXIT
+trap 'rm -f "$NEON_DISASSEMBLY" "$DOTPROD_DISASSEMBLY"' EXIT
+
+# Decode the baseline executable with AArch64 Advanced SIMD enabled. Do not
+# restrict the check to a short mnemonic list: valid compiler output varies
+# (e.g. add/sub/smull/smax/smin/ld1/st1), while vector registers are definitive.
+"$OBJDUMP" --mattr=+neon -d Pea-Android-ARM64-NEON > "$NEON_DISASSEMBLY"
+NEON_VECTOR_LINES="$(grep -Eic '(^|[[:space:],])v[0-9]{1,2}(\.[0-9]+[bhsd])?([[:space:],]|$)' "$NEON_DISASSEMBLY" || true)"
+if [[ "$NEON_VECTOR_LINES" -lt 5 ]]; then
+    echo "ERROR: baseline binary has fewer than 5 decoded AArch64 SIMD vector-register instruction lines." >&2
+    echo "Detected vector instruction lines: $NEON_VECTOR_LINES" >&2
+    echo "First disassembly lines for diagnosis:" >&2
+    sed -n '1,100p' "$NEON_DISASSEMBLY" >&2
+    exit 1
+fi
+echo "NEON verification passed: detected $NEON_VECTOR_LINES vector-register instruction lines."
+grep -Ei '(^|[[:space:],])v[0-9]{1,2}(\.[0-9]+[bhsd])?([[:space:],]|$)' "$NEON_DISASSEMBLY" | head -8 || true
+
+# Explicitly enable Dotprod decoding, otherwise some LLVM versions show SDOT
+# as an unknown word even though it is present in the binary.
 "$OBJDUMP" --mattr=+dotprod -d Pea-Android-ARM64-DOTPROD > "$DOTPROD_DISASSEMBLY"
 if ! grep -Eiq '[[:space:]]sdot[[:space:]]' "$DOTPROD_DISASSEMBLY"; then
     echo "ERROR: Dotprod binary contains no decoded SDOT instruction (disassembly used --mattr=+dotprod)." >&2
     grep -Ei 'unknown|\.word|dotprod' "$DOTPROD_DISASSEMBLY" | head -20 >&2 || true
     exit 1
 fi
-if ! "$OBJDUMP" -d Pea-Android-ARM64-NEON | grep -Eq '\b(add|smax|smin|smull|sqxtn|sqxtun)\s+v[0-9]+'; then
-    echo "ERROR: no expected NEON vector instructions detected in baseline binary." >&2
-    exit 1
-fi
+echo "Dotprod verification passed: SDOT instruction detected."
 
 mkdir -p dist
 mv Pea-Android-ARM64-NEON Pea-Android-ARM64-DOTPROD pea-network.sha256 dist/
