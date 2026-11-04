@@ -49,8 +49,15 @@ jobs:
             echo "sdkmanager not found under $SDK_ROOT/cmdline-tools" >&2
             exit 1
           fi
+          # sdkmanager may finish normally and close stdin before `yes` exits.
+          # With pipefail enabled, that expected SIGPIPE from `yes` makes the
+          # whole pipeline look failed. Disable pipefail only for these two
+          # pipelines: the pipeline status then reflects sdkmanager (last command),
+          # so genuine sdkmanager errors still fail this step.
+          set +o pipefail
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" "ndk;27.2.12479018"
+          set -o pipefail
           NDK_HOME="$SDK_ROOT/ndk/27.2.12479018"
           test -x "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
           {
