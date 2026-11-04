@@ -177,7 +177,29 @@ fn activate_ft(acc: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
     }
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(target_feature = "avx2")))]
+fn activate_ft(acc: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
+    use core::arch::aarch64::*;
+
+    // Exact integer equivalent of the scalar activation: clamp both
+    // accumulator halves to [0, QA], multiply in i32, then shift by FT_SHIFT.
+    unsafe {
+        let zero = vdupq_n_s16(0);
+        let qa = vdupq_n_s16(QA);
+        for i in (0..HALF).step_by(8) {
+            let a = vmaxq_s16(vminq_s16(vld1q_s16(acc.as_ptr().add(i)), qa), zero);
+            let b = vmaxq_s16(vminq_s16(vld1q_s16(acc.as_ptr().add(i + HALF)), qa), zero);
+
+            let lo = vshrq_n_s32::<9>(vmull_s16(vget_low_s16(a), vget_low_s16(b)));
+            let hi = vshrq_n_s32::<9>(vmull_s16(vget_high_s16(a), vget_high_s16(b)));
+            let lo = vqmovun_s32(lo);
+            let hi = vqmovun_s32(hi);
+            vst1_u8(out.as_mut_ptr().add(i), vqmovn_u16(vcombine_u16(lo, hi)));
+        }
+    }
+}
+
+#[cfg(not(any(target_feature = "avx2", all(target_arch = "aarch64", target_feature = "neon"))))]
 fn activate_ft(acc: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
     for i in 0..HALF {
         let a = i32::from(acc[i]).clamp(0, i32::from(QA));
@@ -252,7 +274,93 @@ fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) 
     }
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) -> [i32; L2_SIZE] {
+    use core::arch::aarch64::*;
+
+    // The activation bytes are unsigned, whereas SDOT consumes signed bytes.
+    // Split x into low7 + highbit. highbit is represented as -128; subtracting
+    // its SDOT result restores the exact unsigned-by-signed product x * weight.
+    unsafe {
+        let mut acc_low = [vdupq_n_s32(0); 4];
+        let mut acc_high = [vdupq_n_s32(0); 4];
+        let mut repeated = [0u8; 16];
+        let low_mask = vdupq_n_u8(0x7f);
+        let high_mask = vdupq_n_u8(0x80);
+
+        for c in 0..L1_CHUNKS {
+            let x = &input[c * 4..c * 4 + 4];
+            if x == [0, 0, 0, 0] {
+                continue;
+            }
+            for j in 0..4 {
+                repeated[j * 4..j * 4 + 4].copy_from_slice(x);
+            }
+            let x_vec = vld1q_u8(repeated.as_ptr());
+            let x_low = vreinterpretq_s8_u8(vandq_u8(x_vec, low_mask));
+            let x_high = vreinterpretq_s8_u8(vandq_u8(x_vec, high_mask));
+
+            for group in 0..4 {
+                let w = vld1q_s8(weights.as_ptr().add(c * L2_SIZE * 4 + group * 16));
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {x:v}.16b, {w:v}.16b",
+                    acc = inout(vreg) acc_low[group],
+                    x = in(vreg) x_low,
+                    w = in(vreg) w,
+                    options(nostack, nomem)
+                );
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {x:v}.16b, {w:v}.16b",
+                    acc = inout(vreg) acc_high[group],
+                    x = in(vreg) x_high,
+                    w = in(vreg) w,
+                    options(nostack, nomem)
+                );
+            }
+        }
+
+        let mut out = [0i32; L2_SIZE];
+        for group in 0..4 {
+            vst1q_s32(out.as_mut_ptr().add(group * 4), vsubq_s32(acc_low[group], acc_high[group]));
+        }
+        out
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(target_feature = "dotprod"), not(target_feature = "avx2")))]
+fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) -> [i32; L2_SIZE] {
+    use core::arch::aarch64::*;
+
+    // NEON-only exact u8 x i8 accumulation. vld4_s8 deinterleaves each
+    // eight-output block so the four input lanes can be multiplied in parallel.
+    unsafe {
+        let mut acc = [vdupq_n_s32(0); 4];
+        for c in 0..L1_CHUNKS {
+            let x = &input[c * 4..c * 4 + 4];
+            if x == [0, 0, 0, 0] {
+                continue;
+            }
+            for group in 0..2 {
+                let ptr = weights.as_ptr().add(c * L2_SIZE * 4 + group * 8 * 4);
+                let w = vld4_s8(ptr);
+                let lanes = [w.0, w.1, w.2, w.3];
+                for k in 0..4 {
+                    let w16 = vmovl_s8(lanes[k]);
+                    let x16 = vdup_n_s16(i16::from(x[k]));
+                    acc[group * 2] = vaddq_s32(acc[group * 2], vmull_s16(vget_low_s16(w16), x16));
+                    acc[group * 2 + 1] = vaddq_s32(acc[group * 2 + 1], vmull_s16(vget_high_s16(w16), x16));
+                }
+            }
+        }
+        let mut out = [0i32; L2_SIZE];
+        for i in 0..4 {
+            vst1q_s32(out.as_mut_ptr().add(i * 4), acc[i]);
+        }
+        out
+    }
+}
+
+#[cfg(not(any(target_feature = "avx2", all(target_arch = "aarch64", target_feature = "neon"))))]
 fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) -> [i32; L2_SIZE] {
     let mut out = [0i32; L2_SIZE];
     for c in 0..L1_CHUNKS {
@@ -286,6 +394,16 @@ impl Accumulator {
 
     /// Add a feature to an accumulator.
     pub fn add_feature(&mut self, feature_idx: usize, net: &Network) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            use core::arch::aarch64::*;
+            for i in (0..HIDDEN_SIZE).step_by(8) {
+                let dst = self.vals.as_mut_ptr().add(i);
+                let src = net.feature_weights[feature_idx].vals.as_ptr().add(i);
+                vst1q_s16(dst, vaddq_s16(vld1q_s16(dst), vld1q_s16(src)));
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
         for (i, d) in self.vals.iter_mut().zip(&net.feature_weights[feature_idx].vals) {
             *i += *d
         }
@@ -293,15 +411,35 @@ impl Accumulator {
 
     /// Combine remove and add features per move into a list and do them in one go instead as one per one.
     pub fn apply_feature_updates(&mut self, adds: &[usize], removes: &[usize], net: &Network) {
-
-        for &idx in adds {
-            for (i, d) in self.vals.iter_mut().zip(&net.feature_weights[idx].vals) {
-                *i += *d
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            use core::arch::aarch64::*;
+            for &idx in adds {
+                for i in (0..HIDDEN_SIZE).step_by(8) {
+                    let dst = self.vals.as_mut_ptr().add(i);
+                    let src = net.feature_weights[idx].vals.as_ptr().add(i);
+                    vst1q_s16(dst, vaddq_s16(vld1q_s16(dst), vld1q_s16(src)));
+                }
+            }
+            for &idx in removes {
+                for i in (0..HIDDEN_SIZE).step_by(8) {
+                    let dst = self.vals.as_mut_ptr().add(i);
+                    let src = net.feature_weights[idx].vals.as_ptr().add(i);
+                    vst1q_s16(dst, vsubq_s16(vld1q_s16(dst), vld1q_s16(src)));
+                }
             }
         }
-        for &idx in removes {
-            for (i, d) in self.vals.iter_mut().zip(&net.feature_weights[idx].vals) {
-                *i -= *d
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            for &idx in adds {
+                for (i, d) in self.vals.iter_mut().zip(&net.feature_weights[idx].vals) {
+                    *i += *d
+                }
+            }
+            for &idx in removes {
+                for (i, d) in self.vals.iter_mut().zip(&net.feature_weights[idx].vals) {
+                    *i -= *d
+                }
             }
         }
     }
