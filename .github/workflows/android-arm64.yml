@@ -95,7 +95,7 @@ jobs:
 
       - name: Build ARM64 NEON and Dotprod variants
         shell: bash
-        run: ./scripts/build-android.sh
+        run: bash ./scripts/build-android.sh
 
       - name: Build and run host UCI smoke test
         shell: bash
