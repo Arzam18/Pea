@@ -128,7 +128,7 @@ impl UciHandler {
 
 
     fn on_uci(&self) {
-        println!("id name Pea {}", env!("CARGO_PKG_VERSION"));
+        println!("id name Pea {} ({})", env!("CARGO_PKG_VERSION"), env!("PEA_UCI_DATE"));
         println!("id author {}", env!("CARGO_PKG_AUTHORS"));
         println!("option name Hash type spin default 16 min 1 max 1024");
         println!("option name Threads type spin default 1 min 1 max 128");
