@@ -161,7 +161,30 @@ fn activate_ft(acc: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
     }
 }
 
-#[cfg(not(target_feature = "avx2"))]
+#[cfg(target_arch = "aarch64")]
+fn activate_ft(acc: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_s16(0);
+        let qa = vdupq_n_s16(QA);
+        let half = HALF;
+        for i in (0..HALF).step_by(8) {
+            let a = vmaxq_s16(vminq_s16(vld1q_s16(acc.as_ptr().add(i)), qa), zero);
+            let b = vmaxq_s16(vminq_s16(vld1q_s16(acc.as_ptr().add(i + half)), qa), zero);
+
+            // The scalar definition is (a * b) >> FT_SHIFT. Widen before
+            // multiplying so this is exact and cannot overflow 16 bits.
+            let lo = vshrq_n_s32::<9>(vmull_s16(vget_low_s16(a), vget_low_s16(b)));
+            let hi = vshrq_n_s32::<9>(vmull_s16(vget_high_s16(a), vget_high_s16(b)));
+            let lo_u16 = vqmovun_s32(lo);
+            let hi_u16 = vqmovun_s32(hi);
+            let packed = vqmovn_u16(vcombine_u16(lo_u16, hi_u16));
+            vst1_u8(out.as_mut_ptr().add(i), packed);
+        }
+    }
+}
+
+#[cfg(not(any(target_feature = "avx2", target_arch = "aarch64")))]
 fn activate_ft(acc: &[i16; HIDDEN_SIZE], out: &mut [u8]) {
     for i in 0..HALF {
         let a = i32::from(acc[i]).clamp(0, i32::from(QA));
@@ -236,7 +259,97 @@ fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) 
     }
 }
 
-#[cfg(not(target_feature = "avx2"))]
+// ARMv8-A NEON implementation of the sparse u8 x i8 first dense layer.
+// The input is transformed from unsigned to signed by subtracting 128.
+// We then add 128 * sum(weights) to recover the exact unsigned dot product.
+#[cfg(all(target_arch = "aarch64", not(target_feature = "dotprod")))]
+fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) -> [i32; L2_SIZE] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut accum = [vdupq_n_s32(0); 4];
+        for c in 0..L1_CHUNKS {
+            let x = &input[c * 4..c * 4 + 4];
+            if x == [0, 0, 0, 0] {
+                continue;
+            }
+            let raw = i32::from_ne_bytes([x[0], x[1], x[2], x[3]]);
+            let x_signed = veorq_s8(
+                vreinterpretq_s8_s32(vdupq_n_s32(raw)),
+                vdupq_n_s8(i8::MIN),
+            );
+            for group in 0..4 {
+                let w = vld1q_s8(weights.as_ptr().add(c * 64 + group * 16));
+                let products_lo = vmull_s8(vget_low_s8(x_signed), vget_low_s8(w));
+                let products_hi = vmull_s8(vget_high_s8(x_signed), vget_high_s8(w));
+                let pairs_lo = vpaddlq_s16(products_lo);
+                let pairs_hi = vpaddlq_s16(products_hi);
+                let signed_dot = vpaddq_s32(pairs_lo, pairs_hi);
+                let weight_sums = vpaddlq_s16(vpaddlq_s8(w));
+                let correction = vshlq_n_s32::<7>(weight_sums);
+                accum[group] = vaddq_s32(accum[group], vaddq_s32(signed_dot, correction));
+            }
+        }
+        let mut out = [0i32; L2_SIZE];
+        for group in 0..4 {
+            vst1q_s32(out.as_mut_ptr().add(group * 4), accum[group]);
+        }
+        out
+    }
+}
+
+// ARMv8.2-A DotProd implementation. `SDOT` consumes signed bytes, while
+// this NNUE layer stores unsigned activations and signed weights. Mapping
+// x -> x-128 and adding 128*sum(weights) makes the result bit-exact.
+#[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
+fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) -> [i32; L2_SIZE] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_s32(0);
+        let ones = vdupq_n_s8(1);
+        let mut accum = [zero; 4];
+        for c in 0..L1_CHUNKS {
+            let x = &input[c * 4..c * 4 + 4];
+            if x == [0, 0, 0, 0] {
+                continue;
+            }
+            let raw = i32::from_ne_bytes([x[0], x[1], x[2], x[3]]);
+            let x_signed = veorq_s8(
+                vreinterpretq_s8_s32(vdupq_n_s32(raw)),
+                vdupq_n_s8(i8::MIN),
+            );
+            for group in 0..4 {
+                let w = vld1q_s8(weights.as_ptr().add(c * 64 + group * 16));
+                // Keep Rust 1.93 compatibility: the stable vdotq_s32
+                // intrinsic arrived after this project's pinned toolchain.
+                let mut signed_dot = zero;
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {weights:v}.16b, {input:v}.16b",
+                    acc = inout(vreg) signed_dot,
+                    weights = in(vreg) w,
+                    input = in(vreg) x_signed,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+                let mut weight_sums = zero;
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {weights:v}.16b, {ones:v}.16b",
+                    acc = inout(vreg) weight_sums,
+                    weights = in(vreg) w,
+                    ones = in(vreg) ones,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+                let correction = vshlq_n_s32::<7>(weight_sums);
+                accum[group] = vaddq_s32(accum[group], vaddq_s32(signed_dot, correction));
+            }
+        }
+        let mut out = [0i32; L2_SIZE];
+        for group in 0..4 {
+            vst1q_s32(out.as_mut_ptr().add(group * 4), accum[group]);
+        }
+        out
+    }
+}
+
+#[cfg(not(any(target_feature = "avx2", target_arch = "aarch64")))]
 fn l1_forward(input: &[u8; HIDDEN_SIZE], weights: &[i8; HIDDEN_SIZE * L2_SIZE]) -> [i32; L2_SIZE] {
     let mut out = [0i32; L2_SIZE];
     for c in 0..L1_CHUNKS {
@@ -304,7 +417,25 @@ pub fn update_into(dest_acc: *mut Accumulator, source_acc: *const Accumulator, a
             t += TILE;
         }
     }
-    #[cfg(not(target_feature = "avx2"))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let source_vals = (*source_acc).vals.as_ptr();
+        let dest_vals = (*dest_acc).vals.as_mut_ptr();
+        let mut i = 0;
+        while i < HIDDEN_SIZE {
+            let mut v = vld1q_s16(source_vals.add(i));
+            for &a in adds {
+                v = vaddq_s16(v, vld1q_s16(net.feature_weights[a].vals.as_ptr().add(i)));
+            }
+            for &rm in removes {
+                v = vsubq_s16(v, vld1q_s16(net.feature_weights[rm].vals.as_ptr().add(i)));
+            }
+            vst1q_s16(dest_vals.add(i), v);
+            i += 8;
+        }
+    }
+    #[cfg(not(any(target_feature = "avx2", target_arch = "aarch64")))]
     unsafe {
         let source_vals = (*source_acc).vals;
         let dest_vals = &mut (*dest_acc).vals;
