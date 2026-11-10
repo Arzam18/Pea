@@ -1,0 +1,175 @@
+name: Build Pea for Android ARM64 (NEON + DotProd)
+
+on:
+  workflow_dispatch:
+    inputs:
+      uci_date:
+        description: "UCI build date/version identity (YYYYMMDD)"
+        required: true
+        default: "20261110"
+        type: string
+      nnue_url:
+        description: "Optional direct URL for the exact original quantised.bin NNUE (used only if it is not already present)"
+        required: false
+        default: ""
+        type: string
+      nnue_sha256:
+        description: "Optional SHA-256 of quantised.bin; recommended when supplying nnue_url"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  android-arm64:
+    runs-on: ubuntu-22.04
+    env:
+      PEA_UCI_DATE: ${{ inputs.uci_date }}
+      NNUE_URL: ${{ inputs.nnue_url }}
+      NNUE_SHA256: ${{ inputs.nnue_sha256 }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.93.1 and Android target
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: aarch64-linux-android
+
+      - name: Locate Android NDK toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [[ -z "$NDK_PATH" || ! -d "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin" ]]; then
+            SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+            if [[ -d "$SDK_ROOT/ndk" ]]; then
+              NDK_PATH="$(find "$SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+            fi
+          fi
+
+          if [[ -z "${NDK_PATH:-}" || ! -x "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" ]]; then
+            echo "ERROR: Android NDK with aarch64-linux-android24-clang was not found on this runner."
+            exit 1
+          fi
+
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "ANDROID_STRIP=$TOOLCHAIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "ANDROID_OBJDUMP=$TOOLCHAIN/llvm-objdump" >> "$GITHUB_ENV"
+          echo "ANDROID_READELF=$TOOLCHAIN/llvm-readelf" >> "$GITHUB_ENV"
+
+          echo "Using Android NDK: $NDK_PATH"
+          "$TOOLCHAIN/aarch64-linux-android24-clang" --version
+
+      - name: Stage and verify the original NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+          NNUE_PATH="nnue/files/quantised.bin"
+          mkdir -p nnue/files
+
+          if [[ ! -s "$NNUE_PATH" ]]; then
+            if [[ -z "$NNUE_URL" ]]; then
+              echo "ERROR: The uploaded source archive does not contain nnue/files/quantised.bin."
+              echo "Provide the original network URL in the workflow's nnue_url input, or commit the original network at that path."
+              echo "No replacement or random network will be generated."
+              exit 1
+            fi
+            echo "Downloading the original Pea NNUE..."
+            curl --fail --location --retry 3 --retry-delay 2 --max-filesize 12000000 "$NNUE_URL" -o "$NNUE_PATH"
+          fi
+
+          # Network layout: repr(C) Network with a 64-byte-aligned Accumulator.
+          # This exact byte count is required by the source's include_bytes! transmute.
+          EXPECTED_SIZE=9655872
+          ACTUAL_SIZE="$(stat -c%s "$NNUE_PATH")"
+          if [[ "$ACTUAL_SIZE" != "$EXPECTED_SIZE" ]]; then
+            echo "ERROR: NNUE size mismatch: expected $EXPECTED_SIZE bytes, got $ACTUAL_SIZE."
+            exit 1
+          fi
+
+          if [[ -n "$NNUE_SHA256" ]]; then
+            if [[ ! "$NNUE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "ERROR: nnue_sha256 must be a 64-character SHA-256 hex digest."
+              exit 1
+            fi
+            echo "$NNUE_SHA256  $NNUE_PATH" | sha256sum --check --status
+          fi
+
+          echo "Original NNUE verified: $NNUE_PATH ($ACTUAL_SIZE bytes)"
+          sha256sum "$NNUE_PATH" | tee release-nnue.sha256
+
+      - name: Verify exact u8-by-i8 DotProd arithmetic
+        shell: bash
+        run: python3 scripts/test-dotprod-math.py
+
+      - name: Build baseline Android ARM64 NEON
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          CARGO_TARGET_DIR=target/android-neon \
+            cargo --config 'target.aarch64-linux-android.rustflags = ["-C", "target-cpu=generic", "-C", "target-feature=+neon", "-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-Wl,-z,common-page-size=16384"]' \
+            build --locked --release --target aarch64-linux-android --bin Pea
+
+          BIN="target/android-neon/aarch64-linux-android/release/Pea"
+          test -s "$BIN"
+          cp "$BIN" release/pea-android-arm64-neon
+          "$ANDROID_STRIP" --strip-unneeded release/pea-android-arm64-neon
+
+      - name: Build Android ARM64 DotProd
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CARGO_TARGET_DIR=target/android-dotprod \
+            cargo --config 'target.aarch64-linux-android.rustflags = ["-C", "target-cpu=generic", "-C", "target-feature=+neon,+dotprod", "-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "link-arg=-Wl,-z,common-page-size=16384"]' \
+            build --locked --release --target aarch64-linux-android --bin Pea
+
+          BIN="target/android-dotprod/aarch64-linux-android/release/Pea"
+          test -s "$BIN"
+          cp "$BIN" release/pea-android-arm64-neon-dotprod
+          "$ANDROID_STRIP" --strip-unneeded release/pea-android-arm64-neon-dotprod
+
+      - name: Verify both Android executables and instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-android-arm64.sh release/pea-android-arm64-neon neon
+          bash scripts/verify-android-arm64.sh release/pea-android-arm64-neon-dotprod dotprod
+
+      - name: Record build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Engine=Pea"
+            echo "Version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+            echo "UCI_Date=$PEA_UCI_DATE"
+            echo "Target=aarch64-linux-android"
+            echo "Android_API=24"
+            echo "NNUE=nnue/files/quantised.bin"
+            echo "NNUE_SHA256=$(awk '{print $1}' release-nnue.sha256)"
+            echo "NEON_Binary=pea-android-arm64-neon"
+            echo "DotProd_Binary=pea-android-arm64-neon-dotprod"
+            echo "DotProd_Kernel=SDOT exact u8-by-i8 correction"
+          } > release/build-metadata.txt
+
+      - name: Upload Android ARM64 binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: pea-android-arm64-neon-dotprod-${{ inputs.uci_date }}
+          path: |
+            release/pea-android-arm64-neon
+            release/pea-android-arm64-neon-dotprod
+            release/build-metadata.txt
+            release-nnue.sha256
+          if-no-files-found: error
