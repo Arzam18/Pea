@@ -29,7 +29,7 @@ from better engines like [Akimbo][Akimbo] and [Viridithas][Viridithas].
 
 I started training two NNUEs from scratch. One with  (768 -> 1536)x2 -> 1x8 (Net 0) and one 
 (768 -> 64)x2 -> 1 (Net 1). For more information about this progression see the CHANGELOG.md. 
-However as of today I'm working with a main (768x4hm -> 1536)x2 -> (32 -> 16 -> 1)x8 multilayer net.
+However as of todat I'm working with a main (768x4hm -> 1536)x2 -> (32 -> 16 -> 1)x8 multilayer net.
 You can play the latest generations of my networks on lichess : [Net 0][lichess-link0], [Net 1][lichess-link1].
 
 ---
@@ -231,3 +231,15 @@ This project is licensed under the [GNU General Public License v3.0][license-lin
 [cutechess]: https://cutechess.com
 [shredder]: https://www.shredderchess.com
 [bullet]: https://github.com/jw1912/bullet
+
+
+## Android ARM64 builds
+
+The Android workflow produces two self-contained UCI executables:
+
+- `pea-android-arm64-neon`: baseline AArch64 with the guaranteed NEON/SIMD path.
+- `pea-android-arm64-neon-dotprod`: AArch64 with the optional DotProd extension and a bit-exact `u8 × i8` SDOT NNUE first-layer kernel.
+
+The DotProd kernel maps unsigned activations `x` to signed values `x - 128`, performs SDOT against the signed network weights, then adds `128 * sum(weights)` per output. This preserves the original integer dot product without quantizing or changing network weights. The DotProd binary requires an Android ARM64 CPU that supports the DotProd extension; use the baseline NEON binary on other ARM64 devices.
+
+**Original NNUE requirement:** the source embeds `nnue/files/quantised.bin` at compile time. The provided source archive did not contain this file. The Android workflow therefore accepts `nnue_url` (and optional `nnue_sha256`) as manual inputs, or uses the original file if it is already present in the checkout. It checks the exact expected network layout size and never fabricates replacement weights.
