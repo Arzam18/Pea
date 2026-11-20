@@ -15,6 +15,7 @@ pub enum Bound {
     Exact = 0,
     Lower = 1,
     Upper = 2,
+    None  = 3,
 }
 
 impl Bound {
@@ -22,7 +23,8 @@ impl Bound {
         match v & 0b11 {
             0 => Bound::Exact,
             1 => Bound::Lower,
-            _ => Bound::Upper,
+            2 => Bound::Upper,
+            _ => Bound::None,
         }
     }
 }
@@ -126,6 +128,14 @@ impl PackedEntry {
             best_move: decode_move_partial(layout.mv),
         })
     }
+
+    fn peek(&self) -> (u64, u8, u8) {
+        let data = self.data.load(Ordering::Relaxed);
+        let stored_key  = self.key.load(Ordering::Relaxed) ^ data;
+        let layout: Layout = unsafe { transmute::<u64, Layout>(data) };
+
+        (stored_key, layout.depth, layout.info >> 3)
+    }
 }
 
 // =====================================================================================================================//
@@ -177,13 +187,20 @@ impl TranspositionTable {
 
         let mut best_move = best_move;
 
-        if let Some(existing) = self.table[idx].load(key) {
-            if existing.key == key
-                && existing.depth > depth as u8 + 2
-                && existing.age == current_age {
+        let (old_key, old_depth, old_age) = self.table[idx].peek(); // old entry on given idx
+        let same_search = old_age == current_age;
+        if old_key == key {
+            if old_depth > depth as u8 + 2
+                && same_search {
                 return;
             }
+        } else if old_key != 0
+            && same_search
+            && bound != Bound::Exact
+            && old_depth as usize > depth + 4 {
+            return; // keep the deep entry, drop the shallow new
         }
+
         if bound == Bound::Upper{
             if let Some(existing) = self.table[idx].load(key) {
                 if existing.key == key
@@ -282,37 +299,31 @@ pub fn encode_move(mv: Option<Move>) -> u16 {
 pub fn decode_move_partial(encoded: u16) -> Option<Move> {
     if encoded == 0 { return None; }
 
-    let from    = Square::new((encoded & 0x3F) as u32);
-    let to      = Square::new(((encoded >> 6) & 0x3F) as u32);
-    let extra   = (encoded >> 12) & 0x3;
-    let mv_type = (encoded >> 14) & 0x3;
+    let from = Square::new((encoded & 0x3F) as u32);
+    let to   = Square::new(((encoded >> 6) & 0x3F) as u32);
 
-    match mv_type {
-        0 => {
-            let promotion = match extra {
-                1 => Some(Role::Queen),
-                2 => Some(Role::Rook),
-                3 => Some(Role::Bishop),
-                4 => Some(Role::Knight),
-                _ => None,
-            };
-            Some(Move::Normal {
-                role:      Role::Pawn, // placeholder
-                from,
-                capture:   None,       // placeholder
-                to,
-                promotion,
-            })
-        }
-        1 => Some(Move::EnPassant { from, to }),
-        2 => Some(Move::Castle { king: from, rook: to }),
-        3 => {
-
-            let role = role_from_index(extra as usize).unwrap_or(Role::Pawn);
-            Some(Move::Put { role, to })
-        }
-        _ => None,
+    if encoded & (1 << 15) != 0 {
+        return if encoded & (1 << 14) != 0 {
+            Some(Move::Castle { king: from, rook: to })
+        } else {
+            Some(Move::EnPassant { from, to })
+        };
     }
+
+    let high = encoded >> 12;
+    if high >= 5 {
+        let role = role_from_index((high - 5) as usize).unwrap_or(Role::Pawn);
+        return Some(Move::Put { role, to: from }); 
+    }
+
+    let promotion = match high {
+        1 => Some(Role::Queen),
+        2 => Some(Role::Rook),
+        3 => Some(Role::Bishop),
+        4 => Some(Role::Knight),
+        _ => None,
+    };
+    Some(Move::Normal { role: Role::Pawn, from, capture: None, to, promotion })
 }
 
 // Validate encoded move against legal moves to get full Move
@@ -342,7 +353,6 @@ pub fn validate_move(encoded: u16, legal_moves: &[Move]) -> Option<Move> {
     }
 
     if high >= 5 {
-        // Put move
         let role = role_from_index((high - 5) as usize).unwrap_or(Role::Pawn);
         return legal_moves.iter().copied().find(|mv| matches!(mv,
             Move::Put { role: r, to: t } if *r == role && *t == to
