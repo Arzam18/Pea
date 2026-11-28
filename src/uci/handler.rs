@@ -10,6 +10,7 @@ use crate::engine::types::PIECE_VALUES;
 use crate::engine::utility::{read_position_from_fen};
 use crate::engine::search::threads::Threads;
 use crate::datagen::datagen_main::run_datagen;
+use crate::engine::corrhist::CorrHistTables;
 use crate::uci::parser::{move_to_uci, uci_to_move, UciCommand};
 use crate::uci::state::UciState;
 const BENCH_FENS: &str = include_str!("../../assets/bench.txt");
@@ -135,7 +136,7 @@ impl UciHandler {
         println!("option name Move Overhead type spin default 10 min 0 max 1000");
         println!("option name UCI_ShowWDL type check default true");
         println!("option name NormalizeScore type check default true");
-        //print_spsa_options(&self.engine.params);
+        _print_spsa_options(&self.engine.params);
         println!("uciok");
     }
 
@@ -150,8 +151,7 @@ impl UciHandler {
         self.engine.position = Chess::new();
         self.engine.tt.clear();
         self.engine.repetition_stack.clear();
-        self.engine.corrhist_pawn.clear();
-        self.engine.corrhist_material.clear();
+        self.engine.corrhist_tables.clear();
         self.engine.history_tables.clear();
     }
 
@@ -233,6 +233,9 @@ impl UciHandler {
         } else {
             // Set tuning parameters
             self.set_param(n, v);
+            if n.to_ascii_lowercase().starts_with("corrhist_") {
+                self.engine.corrhist_tables = CorrHistTables::new(&self.engine.params);
+            }
         }
     }
 
@@ -339,6 +342,13 @@ impl UciHandler {
             "pc_min_depth"           => { if let Ok(x) = value.parse::<i32>() { params.pc_min_depth = x; } }
             "pc_improving_margin"    => { if let Ok(x) = value.parse::<i32>() { params.pc_improving_margin = x; } }
             "pc_see_thr"             => { if let Ok(x) = value.parse::<i32>() { params.pc_see_thr = x; } }
+            "corrhist_material"      => { if let Ok(x) = value.parse::<i32>() { params.corrhist_material = x; } }
+            "corrhist_pawn"          => { if let Ok(x) = value.parse::<i32>() { params.corrhist_pawn = x; } }
+            "corrhist_minors"        => { if let Ok(x) = value.parse::<i32>() { params.corrhist_minors = x; } }
+            "corrhist_majors"        => { if let Ok(x) = value.parse::<i32>() { params.corrhist_majors = x; } }
+            "corrhist_npb"           => { if let Ok(x) = value.parse::<i32>() { params.corrhist_npb = x; } }
+            "corrhist_npw"           => { if let Ok(x) = value.parse::<i32>() { params.corrhist_npw = x; } }
+            "corrhist_cont2"         => { if let Ok(x) = value.parse::<i32>() { params.corrhist_cont2 = x; } }
 
             // floats
             "lmr_red_constant"       => { if let Ok(x) = value.parse::<i32>() { params.lmr_red_constant = x as f32 / 10000.0; } }
@@ -407,6 +417,13 @@ fn _print_spsa_options(params: &Params) {
     println!("option name pc_min_depth type spin default {} min 3 max 10", params.pc_min_depth);
     println!("option name pc_improving_margin type spin default {} min -100 max 100", params.pc_improving_margin);
     println!("option name pc_see_thr type spin default {} min -256 max 256", params.pc_see_thr);
+    println!("option name corrhist_material type spin default {} min 0 max 96", params.corrhist_material);
+    println!("option name corrhist_pawn type spin default {} min 0 max 96", params.corrhist_pawn);
+    println!("option name corrhist_minors type spin default {} min 0 max 96", params.corrhist_minors);
+    println!("option name corrhist_majors type spin default {} min 0 max 96", params.corrhist_majors);
+    println!("option name corrhist_npb type spin default {} min 0 max 96", params.corrhist_npb);
+    println!("option name corrhist_npw type spin default {} min 0 max 96", params.corrhist_npw);
+    println!("option name corrhist_cont2 type spin default {} min 0 max 128", params.corrhist_cont2);
 
     // float
     println!("option name lmr_red_constant type spin default {} min 5000 max 25000", (params.lmr_red_constant * 10000.0) as i32);

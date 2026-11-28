@@ -10,7 +10,7 @@ use crate::engine::search::pv::PvTable;
 use crate::engine::search::see::see;
 use crate::engine::time_manager::TimeManager;
 use crate::engine::tt::{ encode_move, score_from_tt, tt_store, validate_move, Bound};
-use crate::engine::types::{DRAW_SCORE, MATE_SCORE, MAX_INF, MIN_INF, NO_EVAL};
+use crate::engine::types::{DRAW_SCORE, MATE_SCORE, MAX_INF, MAX_PLY, MIN_INF, NO_EVAL};
 use crate::engine::utility::{print_search_info};
 use crate::uci::state::UciState;
 
@@ -94,10 +94,7 @@ pub fn search(pos: &Chess, ctx: &mut SearchContext, uci : &UciState, max_depth: 
     ctx.stats.duration = tm.elapsed();
 
     // Age history tables
-    ctx.corrhist_pawn.age_entries();
-    ctx.corrhist_material.age_entries();
-    ctx.corrhist_minor.age_entries();
-    ctx.corrhist_major.age_entries();
+    ctx.corrhist.age_entries();
     
     (best_score, best_move.unwrap(), tt_pv, ctx.stats)
 }
@@ -178,7 +175,7 @@ pub fn negamax(
         None
     };
 
-    if !is_root && !is_excluded && tt_entry.is_some() {
+    if !is_pv && !is_root && !is_excluded && tt_entry.is_some() {
         if let Some(score) = tt_entry.as_ref().and_then(|e| e.try_score(depth, alpha, beta, ply)) {
             return score;
         }
@@ -197,7 +194,7 @@ pub fn negamax(
     let static_eval = if is_excluded {
         raw_eval
     } else {
-        corr = ctx.corrhist_pawn.correct_evaluation(pos) + ctx.corrhist_material.correct_evaluation(pos);
+        corr = ctx.corrhist.correct_evaluation(pos, &ctx.stack.moves, ply);
         raw_eval + corr
     };
 
@@ -584,13 +581,14 @@ pub fn negamax(
         }
 
         let mut child_pos = pos.clone();
+
         child_pos.play_unchecked(mv);
 
+        let hash_child = child_pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0;
 
+        ctx.tt.prefetch(hash_child);
 
         make_move_nnue(pos, &child_pos,&mv, &mut ctx.nnue);
-
-        let hash_child = child_pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0;
 
         ctx.increase_history(hash_child);
 
@@ -672,6 +670,11 @@ pub fn negamax(
             best_move = Some(mv);
         }
 
+        // Add pv for mate scores where score = beta. Fixes possible missing pv for mating move
+        if is_pv && score > alpha {
+            pv.add_child_to_parent(mv, &local_pv);
+        }
+
         if score >= beta {
             let bonus = ctx.params.cont_hist_scaling * depth as i32 - ctx.params.cont_hist_base;
             let malus = ctx.params.cont_hist_malus_scaling * depth as i32 - ctx.params.cont_hist_malus_base;
@@ -688,14 +691,11 @@ pub fn negamax(
             }else {
                 ctx.history.noisy.update(pos,&mv,bonus,malus,&tacticals_searched);
             }
-
             break;
         }
         if score > alpha {
             alpha = score;
-            pv.add_child_to_parent(mv,&local_pv);
             node_type = Bound::Exact;
-
         }
     }
 
@@ -707,8 +707,7 @@ pub fn negamax(
     if !is_excluded && !in_check && !best_move.is_some_and(|mv| mv.is_capture() || mv.is_promotion())
         && !(node_type == Bound::Lower && best_score <= static_eval)
         && !(node_type == Bound::Upper && best_score >= static_eval) {
-        ctx.corrhist_pawn.update_correction_history(pos, depth as i32, best_score - static_eval);
-        ctx.corrhist_material.update_correction_history(pos, depth as i32, best_score - static_eval);
+        ctx.corrhist.update_correction_history(pos, depth as i32, best_score - static_eval, &ctx.stack.moves, ply);
     }
 
 
@@ -768,9 +767,7 @@ pub fn quiescence(
     let static_eval = if in_check{
         -MATE_SCORE + ply as i32
     } else{
-        raw_eval
-            + ctx.corrhist_pawn.correct_evaluation(pos)
-            + ctx.corrhist_material.correct_evaluation(pos)
+        raw_eval + ctx.corrhist.correct_evaluation(pos,&ctx.stack.moves,ply)
     };
 
    if static_eval >= beta {
@@ -803,13 +800,19 @@ pub fn quiescence(
 
         child.play_unchecked(mv);
 
-        make_move_nnue(pos, &child, &mv, &mut ctx.nnue);
-
         let child_hash = child.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0;
+
+        ctx.tt.prefetch(child_hash);
+
+        make_move_nnue(pos, &child, &mv, &mut ctx.nnue);
 
         ctx.increase_history(child_hash);
 
+        ctx.stack.moves[ply] = Some(mv);
+
         let score = -quiescence(&child, ctx, -beta, -alpha,ply+1);
+
+        ctx.stack.moves[ply] = None;
 
         ctx.decrease_history();
 
@@ -859,7 +862,11 @@ fn aspiration_search(pos: &Chess, ctx: &mut SearchContext, max_depth: usize, pre
             depth = max_depth;
         } else if score >= beta {
             beta = cmp::min(beta + window, MAX_INF);
-            depth -= 1;
+            if depth > 1 && depth + 3 > max_depth {
+                if !is_mate_score(score){
+                    depth = (depth-1).max(max_depth.saturating_sub(3)).max(1);
+                }
+            }
         } else {
             return score;
         }
@@ -883,6 +890,6 @@ fn minors_or_majors(pos : &Chess) -> Bitboard {
 }
 #[inline(always)]
 fn is_mate_score(score : i32) -> bool {
-    score.abs() >= MATE_SCORE-128
+    score.abs() >= MATE_SCORE-MAX_PLY as i32
 }
 
